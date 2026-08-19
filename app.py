@@ -773,6 +773,7 @@ def source_excel(path):
     return xl
 
 
+@st.cache_data(show_spinner=False)
 def source_sheet(path, aliases, fuzzy=False):
     """Read a source sheet once and reuse the parsed DataFrame."""
     xl = source_excel(path)
@@ -849,6 +850,7 @@ def detect_portal(path):
 
     return None
 
+@st.cache_data(show_spinner=False)
 def read_sheet(path, aliases):
     return source_sheet(path, aliases, fuzzy=False)
 
@@ -856,6 +858,7 @@ def read_sheet(path, aliases):
 # SOURCE ENRICHMENT
 # ============================================================
 
+@st.cache_data(show_spinner=False)
 def amazon_related_order_map(path):
     """Original Amazon order -> original + replacement order IDs."""
     mapping = {}
@@ -879,6 +882,7 @@ def amazon_related_order_map(path):
         pass
     return mapping
 
+@st.cache_data(show_spinner=False)
 def amazon_enrichment(path):
     """Order/Sales/Reverse enrichment using the headers in Amazon FY 26-27."""
     result = {}
@@ -1232,6 +1236,7 @@ def ensure_amazon_adjustment_backfilled():
     return None
 
 
+@st.cache_data(show_spinner=False)
 def amazon_payment_enrichment(path):
     """
     Vectorized Amazon Payments enrichment.
@@ -1431,6 +1436,7 @@ def amazon_payment_enrichment(path):
     return result
 
 
+@st.cache_data(show_spinner=False)
 def amazon_reimbursement_enrichment(path):
     result={}
     try:
@@ -1450,6 +1456,7 @@ def amazon_reimbursement_enrichment(path):
     return result
 
 
+@st.cache_data(show_spinner=False)
 def flipkart_enrichment(path):
     """ERP invoice/CN plus order/return details from Flipkart FY 26-27."""
     result={}
@@ -1665,6 +1672,7 @@ def settlement_status_from_remark(remark, payment_status=""):
 # NORMALIZE PORTAL RECONCILIATION
 # ============================================================
 
+@st.cache_data(show_spinner=False)
 def amazon_reverse_return_type_map(source_path):
     """
     Exact Amazon Return Type mapping.
@@ -2033,6 +2041,7 @@ def normalize_flipkart(reco, source_path):
 
 
 
+@st.cache_data(show_spinner=False)
 def flipkart_reimbursement_map(source_path):
     """
     Exact Flipkart reimbursement mapping:
@@ -4668,7 +4677,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.3 — Clean UI & Dashboard Performance Diagnostics")
+st.caption("Build: v15.4 — Workbook Enrichment Cache Optimization")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
