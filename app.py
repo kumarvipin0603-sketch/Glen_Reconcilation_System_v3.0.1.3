@@ -2081,12 +2081,13 @@ def flipkart_reimbursement_map(source_path):
 def backfill_flipkart_reimbursement_from_source(source_path):
     """
     Persist Flipkart Payments Column-P reimbursement into reconciliation_master.
+    Optimized for Supabase: one batched update instead of one remote call per order.
     """
     mapping = flipkart_reimbursement_map(source_path)
 
     with db() as c:
         c.execute(
-            "UPDATE reconciliation_master SET reimbursement=0 "
+            "UPDATE reconciliation_master SET reimbursement=0, reimbursement_reason='' "
             "WHERE portal='Flipkart'"
         )
 
@@ -2099,30 +2100,36 @@ def backfill_flipkart_reimbursement_from_source(source_path):
             if clean_id(row[0])
         }
 
+        update_rows = []
         matched_orders = 0
         matched_total = 0.0
 
-        for order_no,value in mapping.items():
-            if order_no not in db_orders:
+        for order_no, value in mapping.items():
+            order_no = clean_id(order_no)
+            if not order_no or order_no not in db_orders:
                 continue
 
-            c.execute(
+            value = float(value or 0.0)
+            update_rows.append((
+                value,
+                "Flipkart Payments Column P — Reimbursement" if value != 0 else "",
+                order_no,
+            ))
+
+            if value != 0:
+                matched_orders += 1
+                matched_total += value
+
+        if update_rows:
+            c.executemany(
                 """
                 UPDATE reconciliation_master
                 SET reimbursement=?,
                     reimbursement_reason=?
                 WHERE portal='Flipkart' AND order_no=?
                 """,
-                (
-                    float(value),
-                    "Flipkart Payments Column P — Reimbursement",
-                    order_no,
-                )
+                update_rows
             )
-
-            if float(value) != 0:
-                matched_orders += 1
-                matched_total += float(value)
 
         c.commit()
 
@@ -2130,6 +2137,7 @@ def backfill_flipkart_reimbursement_from_source(source_path):
         "source_total": float(sum(mapping.values())),
         "matched_total": float(matched_total),
         "matched_orders": int(matched_orders),
+        "updated_rows": int(len(update_rows)),
     }
 
 
@@ -2683,17 +2691,14 @@ def restore_operational_history(history):
     now = datetime.now().isoformat(timespec="seconds")
 
     with db() as c:
-        # IMPORTANT FOR SUPABASE: restore all task history in one batched call.
-        # The previous implementation executed one remote SQL statement per task;
-        # 1,000+ tasks could therefore spend many minutes on network round trips.
         task_rows = [
             (
-                r.get("portal", ""), r.get("order_no", ""),
-                r.get("task_type", ""), r.get("branch_code", ""),
-                r.get("task_created_date"), r.get("task_status", ""),
-                r.get("working_date"), r.get("task_completed_date"),
-                r.get("team_remarks", ""), r.get("ticket_raised", ""),
-                r.get("raised_date"), r.get("last_update") or now,
+                r.get("portal",""), r.get("order_no",""), r.get("task_type",""),
+                r.get("branch_code",""), r.get("task_created_date"),
+                r.get("task_status",""), r.get("working_date"),
+                r.get("task_completed_date"), r.get("team_remarks",""),
+                r.get("ticket_raised",""), r.get("raised_date"),
+                r.get("last_update") or now,
             )
             for r in history.get("tasks", [])
         ]
@@ -2725,7 +2730,6 @@ def restore_operational_history(history):
                     last_update=COALESCE(pending_tasks.last_update,excluded.last_update)
             """, task_rows)
 
-        # MIR rows are already persistent and source refresh does not delete them.
         c.commit()
 
 
@@ -4664,7 +4668,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.1 — Payment Status Consistency Repair")
+st.caption("Build: v15.2 — Supabase Post-Save Performance & Stage Diagnostics")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
@@ -4815,42 +4819,61 @@ if workspace == "E-Com Reconciliation Dashboard":
 
                         adjustment_sync = None
                         return_type_sync = None
-
-                        # AUTO-SYNC: no manual Repair/Sync button is required after upload.
-                        # Every new Amazon workbook immediately refreshes the derived fields
-                        # from the same newly uploaded source before the dashboard is shown.
                         flipkart_reimbursement_sync = None
 
                         if portal == "Amazon":
+                            process_status.write("5/9 Syncing Amazon Return Type…")
+                            _stage = perf_counter()
                             return_type_sync = backfill_amazon_return_type_from_source(path)
-                            adjustment_sync = backfill_amazon_adjustment_from_source(path)
-                        elif portal == "Flipkart":
-                            flipkart_reimbursement_sync = (
-                                backfill_flipkart_reimbursement_from_source(path)
+                            process_status.write(
+                                f"Amazon Return Type sync completed in {perf_counter()-_stage:,.1f}s."
                             )
 
-                        # All source-derived mapping is complete at this point.
-                        # Explicitly release cached workbook objects before copying the
-                        # temporary source on Windows. This prevents WinError 32 file locks.
+                            process_status.write("6/9 Syncing Amazon Adjustment…")
+                            _stage = perf_counter()
+                            adjustment_sync = backfill_amazon_adjustment_from_source(path)
+                            process_status.write(
+                                f"Amazon Adjustment sync completed in {perf_counter()-_stage:,.1f}s."
+                            )
+
+                        elif portal == "Flipkart":
+                            process_status.write("5/9 Syncing Flipkart Reimbursement…")
+                            _stage = perf_counter()
+                            flipkart_reimbursement_sync = backfill_flipkart_reimbursement_from_source(path)
+                            process_status.write(
+                                f"Flipkart Reimbursement sync completed in "
+                                f"{perf_counter()-_stage:,.1f}s "
+                                f"({int((flipkart_reimbursement_sync or {}).get('updated_rows',0)):,} rows)."
+                            )
+
                         clear_source_cache(path)
 
-                        # Persist the exact uploaded workbook itself in Supabase.
-                        # It remains the active source until the next workbook for the
-                        # same marketplace is uploaded.
+                        process_status.write("6/9 Saving verified source workbook to Supabase…")
+                        _stage = perf_counter()
                         save_source_workbook(
                             portal,
                             uploaded.name,
                             uploaded.getvalue()
                         )
+                        process_status.write(
+                            f"Source workbook cloud snapshot saved in {perf_counter()-_stage:,.1f}s."
+                        )
 
-                        # Keep a local working copy too (useful on Windows); the cloud
-                        # copy above is the permanent source of truth.
+                        process_status.write("7/9 Updating local fallback source copy…")
+                        _stage = perf_counter()
                         local_source = SOURCE_DIR / f"{portal.lower()}_latest.xlsx"
                         shutil.copy2(path, local_source)
+                        process_status.write(
+                            f"Local source copy updated in {perf_counter()-_stage:,.1f}s."
+                        )
 
-                        # Verify only after all derived fields have been persisted.
+                        process_status.write("8/9 Verifying database totals…")
+                        _stage = perf_counter()
                         db_verified = verify_portal_database_sync(
                             portal, expected_dashboard
+                        )
+                        process_status.write(
+                            f"Database verification completed in {perf_counter()-_stage:,.1f}s."
                         )
                         verification_warnings = db_verified.get(
                             "_verification_warnings", []
@@ -4891,7 +4914,12 @@ if workspace == "E-Com Reconciliation Dashboard":
                                 "No manual sync is required."
                             )
 
+                        process_status.write("9/9 Finalizing history counts and audit…")
+                        _stage = perf_counter()
                         history_after = operational_history_counts(portal)
+                        process_status.write(
+                            f"History count check completed in {perf_counter()-_stage:,.1f}s."
+                        )
 
                         st.info(
                             f"Preserved team history — "
