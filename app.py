@@ -2645,6 +2645,7 @@ def process_workbook(path, portal, progress=None):
 # ============================================================
 # OWNER MASTER
 # ============================================================
+@st.cache_data(ttl=60, show_spinner=False)
 def load_owner_rules():
     with db() as c:
         return pd.read_sql_query("""
@@ -3026,8 +3027,16 @@ def upsert_reconciliation(frame, source_file, record_upload=True):
 # ============================================================
 # TASK / MIR DATA
 # ============================================================
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_tasks():
+    """
+    Load pending tasks once and enrich assignees entirely in memory.
+
+    Performance fix:
+    The older implementation called get_assignees() for every task row.
+    get_assignees() loaded owner rules from the database, so a few thousand
+    tasks could trigger thousands of Supabase reads during dashboard preparation.
+    """
     with db() as c:
         t = pd.read_sql_query("""
             SELECT * FROM pending_tasks
@@ -3040,30 +3049,68 @@ def load_tasks():
     for col in ["task_created_date","working_date","task_completed_date","last_update"]:
         t[col] = pd.to_datetime(t[col], errors="coerce")
 
+    # Vectorized aging.
     today = pd.Timestamp(date.today())
+    start_dates = t["task_created_date"].dt.normalize()
+    completed_dates = t["task_completed_date"].dt.normalize()
+    completed_mask = (
+        t["task_status"].fillna("").astype(str).str.strip().eq("Completed")
+        & completed_dates.notna()
+    )
+    end_dates = pd.Series(today, index=t.index)
+    end_dates.loc[completed_mask] = completed_dates.loc[completed_mask]
+    aging = (end_dates - start_dates).dt.days
+    t["aging_days"] = aging.fillna(0).clip(lower=0).astype(int)
 
-    def aging(r):
-        start = r["task_created_date"]
-        if pd.isna(start):
-            return 0
-        if txt(r["task_status"]) == "Completed" and pd.notna(r["task_completed_date"]):
-            end = r["task_completed_date"]
-        else:
-            end = today
-        return max((end.normalize()-start.normalize()).days,0)
+    # Read owner rules ONCE, aggregate them ONCE, then use dictionary lookup.
+    rules = load_owner_rules()
+    if rules.empty:
+        t["task_assign_to"] = ""
+        t["task_assign_email"] = ""
+        return t
 
-    t["aging_days"] = t.apply(aging, axis=1)
+    r = rules.copy()
+    r["branch_code"] = r["branch_code"].fillna("").astype(str).str.strip()
+    r["task_type"] = r["task_type"].fillna("").astype(str).str.strip()
+    r["owner_name"] = r["owner_name"].fillna("").astype(str).str.strip()
+    r["owner_email"] = r["owner_email"].fillna("").astype(str).str.strip()
 
-    assignees = []
-    emails = []
-    for _, r in t.iterrows():
-        names, mails = get_assignees(r["branch_code"], r["task_type"])
-        assignees.append(names)
-        emails.append(mails)
+    def _joined_unique(series):
+        return "; ".join(dict.fromkeys(v for v in series if v))
 
-    t["task_assign_to"] = assignees
-    t["task_assign_email"] = emails
+    grouped = (
+        r.groupby(["branch_code","task_type"], sort=False, as_index=False)
+        .agg(
+            task_assign_to=("owner_name", _joined_unique),
+            task_assign_email=("owner_email", _joined_unique),
+        )
+    )
+
+    direct = {
+        (str(row.branch_code), str(row.task_type)):
+        (str(row.task_assign_to), str(row.task_assign_email))
+        for row in grouped.itertuples(index=False)
+    }
+
+    fallback = {
+        str(row.task_type): (str(row.task_assign_to), str(row.task_assign_email))
+        for row in grouped[
+            grouped["branch_code"].str.casefold().eq("all branch")
+        ].itertuples(index=False)
+    }
+
+    branches = t["branch_code"].fillna("").astype(str).str.strip().tolist()
+    task_types = t["task_type"].fillna("").astype(str).str.strip().tolist()
+
+    assigned = [
+        direct.get((branch, task_type), fallback.get(task_type, ("","")))
+        for branch, task_type in zip(branches, task_types)
+    ]
+
+    t["task_assign_to"] = [x[0] for x in assigned]
+    t["task_assign_email"] = [x[1] for x in assigned]
     return t
+
 
 def update_task(portal, order_no, task_type, status, team_remarks="", working_date=None, completed_date=None):
     status = txt(status).title()
@@ -3227,15 +3274,18 @@ def _master_with_operational_overlay(master):
     if master.empty:
         return master
 
+    master = master.copy()
     tasks = load_tasks()
     mir = load_mir()
 
     if not tasks.empty:
         def join_unique(series):
             vals = []
+            seen = set()
             for v in series:
                 s = txt(v)
-                if s and s not in vals:
+                if s and s not in seen:
+                    seen.add(s)
                     vals.append(s)
             return " | ".join(vals)
 
@@ -3278,13 +3328,11 @@ def _master_with_operational_overlay(master):
             "sr_no","sr_date","remarks"
         ]].rename(columns={"remarks":"mir_remarks"})
 
-        # Primary MIR match is Branch + Order No. If a source order has a blank
-        # or differently formatted branch, fall back to unique Order No so the
-        # branch-team MIR upload still updates the main reconciliation.
         master = master.merge(
             mir_keep,on=["branch_code","order_no"],how="left"
         )
-        missing_mir = master["mir_no"].fillna("").astype(str).str.strip() == ""
+
+        missing_mir = master["mir_no"].fillna("").astype(str).str.strip().eq("")
         if missing_mir.any():
             unique_mir = mir_keep.drop_duplicates("order_no", keep=False).drop(
                 columns=["branch_code"]
@@ -3304,66 +3352,90 @@ def _master_with_operational_overlay(master):
         ]:
             master[c] = ""
 
-    def combined_team_remarks(r):
-        vals = []
-        for value in [r.get("team_remarks"),r.get("mir_remarks")]:
-            s = txt(value)
-            if s and s not in vals:
-                vals.append(s)
-        sr = txt(r.get("sr_no"))
-        srd = iso_date(r.get("sr_date"))
-        if sr:
-            vals.append(
-                f"SR No: {sr}" + (f" | SR Date: {srd}" if srd else "")
-            )
-        return " | ".join(vals)
-
-    master["combined_team_remarks"] = master.apply(
-        combined_team_remarks,axis=1
+    # -------- Vectorized combined Team Remarks --------
+    team = master.get("team_remarks", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+    mirr = master.get("mir_remarks", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+    sr = master.get("sr_no", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+    srd = pd.to_datetime(
+        master.get("sr_date", pd.Series(pd.NaT, index=master.index)),
+        errors="coerce"
+    )
+    sr_text = pd.Series("", index=master.index, dtype="object")
+    has_sr = sr.ne("")
+    sr_text.loc[has_sr] = "SR No: " + sr.loc[has_sr]
+    has_srd = has_sr & srd.notna()
+    sr_text.loc[has_srd] = (
+        sr_text.loc[has_srd]
+        + " | SR Date: "
+        + srd.loc[has_srd].dt.strftime("%Y-%m-%d")
     )
 
-    # v15.3: After 5 calendar days from TEI generation, explicitly flag a
-    # still-open credit-note task while preserving CN Pending ownership.
-    def tei_cn_pending_remark(r):
-        current = txt(r.get("pending_remarks"))
+    combined = team.copy()
+    add_mir = mirr.ne("") & mirr.ne(team)
+    combined.loc[add_mir & combined.ne("")] = (
+        combined.loc[add_mir & combined.ne("")]
+        + " | "
+        + mirr.loc[add_mir & combined.ne("")]
+    )
+    combined.loc[add_mir & combined.eq("")] = mirr.loc[add_mir & combined.eq("")]
 
-        # v15.4: If Return Delivery Date is at least 2 calendar days old and
-        # TEI is still not created, surface the operational aging status.
-        return_date = pd.to_datetime(r.get("return_delivery_date"), errors="coerce")
-        tei_no_now = txt(r.get("tei_no"))
-        tei_date_now = pd.to_datetime(r.get("tei_date"), errors="coerce")
-        if pd.notna(return_date) and not tei_no_now and pd.isna(tei_date_now):
-            age_from_return = (pd.Timestamp(date.today()) - return_date.normalize()).days
-            if age_from_return >= 2:
-                return "Return Received TEI Pending"
-        if "cn pending" not in current.lower():
-            return current
+    add_sr = sr_text.ne("")
+    combined.loc[add_sr & combined.ne("")] = (
+        combined.loc[add_sr & combined.ne("")]
+        + " | "
+        + sr_text.loc[add_sr & combined.ne("")]
+    )
+    combined.loc[add_sr & combined.eq("")] = sr_text.loc[add_sr & combined.eq("")]
+    master["combined_team_remarks"] = combined
 
-        tei_no = txt(r.get("tei_no"))
-        tei_date = pd.to_datetime(r.get("tei_date"), errors="coerce")
-        cn_no = txt(r.get("cn_no"))
-        cn_date = pd.to_datetime(r.get("cn_date"), errors="coerce")
+    # -------- Vectorized TEI/CN pending remark aging --------
+    current = master["pending_remarks"].fillna("").astype(str)
+    new_remarks = current.copy()
 
-        if not tei_no or pd.isna(tei_date):
-            return current
-        if cn_no or not pd.isna(cn_date):
-            return current
+    return_date = pd.to_datetime(master.get("return_delivery_date"), errors="coerce")
+    tei_no = master.get("tei_no", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+    tei_date = pd.to_datetime(master.get("tei_date"), errors="coerce")
+    cn_no = master.get("cn_no", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+    cn_date = pd.to_datetime(master.get("cn_date"), errors="coerce")
+    today_ts = pd.Timestamp(date.today())
 
-        age_days = (pd.Timestamp(date.today()) - tei_date.normalize()).days
-        if age_days >= 5:
-            return "TEI Generated but CN Pending"
-        return current
+    # Priority 1: return received >=2 days and TEI still absent.
+    return_age = (today_ts - return_date.dt.normalize()).dt.days
+    tei_pending = (
+        return_date.notna()
+        & tei_no.eq("")
+        & tei_date.isna()
+        & return_age.ge(2)
+    )
+    new_remarks.loc[tei_pending] = "Return Received TEI Pending"
 
-    master["pending_remarks"] = master.apply(tei_cn_pending_remark, axis=1)
+    # Priority 2 applies only where priority 1 did not override.
+    cn_pending = current.str.contains("cn pending", case=False, na=False)
+    tei_age = (today_ts - tei_date.dt.normalize()).dt.days
+    generated_cn_pending = (
+        ~tei_pending
+        & cn_pending
+        & tei_no.ne("")
+        & tei_date.notna()
+        & cn_no.eq("")
+        & cn_date.isna()
+        & tei_age.ge(5)
+    )
+    new_remarks.loc[generated_cn_pending] = "TEI Generated but CN Pending"
+
+    master["pending_remarks"] = new_remarks
     return master
+
 
 def ecom_process_display(master):
     """Attached reconciliation output structure + hidden filter columns."""
     if master.empty:
         return pd.DataFrame()
 
+    _overlay_started = perf_counter()
     master = _master_with_operational_overlay(master)
-    out = pd.DataFrame()
+    st.caption(f"Operational overlay: {perf_counter()-_overlay_started:,.1f}s")
+    out = pd.DataFrame(index=master.index)
 
     # Hidden filter fields.
     out["Market Place"] = master["portal"]
@@ -4761,7 +4833,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.5 — Vectorized Marketplace Enrichment")
+st.caption("Build: v15.6 — Fast Dashboard Operational Overlay")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
