@@ -2683,9 +2683,23 @@ def restore_operational_history(history):
     now = datetime.now().isoformat(timespec="seconds")
 
     with db() as c:
-        # Restore task history.
-        for r in history.get("tasks",[]):
-            c.execute("""
+        # IMPORTANT FOR SUPABASE: restore all task history in one batched call.
+        # The previous implementation executed one remote SQL statement per task;
+        # 1,000+ tasks could therefore spend many minutes on network round trips.
+        task_rows = [
+            (
+                r.get("portal", ""), r.get("order_no", ""),
+                r.get("task_type", ""), r.get("branch_code", ""),
+                r.get("task_created_date"), r.get("task_status", ""),
+                r.get("working_date"), r.get("task_completed_date"),
+                r.get("team_remarks", ""), r.get("ticket_raised", ""),
+                r.get("raised_date"), r.get("last_update") or now,
+            )
+            for r in history.get("tasks", [])
+        ]
+
+        if task_rows:
+            c.executemany("""
                 INSERT INTO pending_tasks(
                     portal,order_no,task_type,branch_code,
                     task_created_date,task_status,working_date,
@@ -2695,60 +2709,23 @@ def restore_operational_history(history):
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(portal,order_no,task_type) DO UPDATE SET
                     branch_code=COALESCE(NULLIF(excluded.branch_code,''),pending_tasks.branch_code),
-                    task_created_date=COALESCE(
-                        pending_tasks.task_created_date,
-                        excluded.task_created_date
-                    ),
+                    task_created_date=COALESCE(pending_tasks.task_created_date,excluded.task_created_date),
                     task_status=CASE
                         WHEN COALESCE(TRIM(pending_tasks.task_status),'')=''
-                        THEN excluded.task_status
-                        ELSE pending_tasks.task_status
-                    END,
-                    working_date=COALESCE(
-                        pending_tasks.working_date,
-                        excluded.working_date
-                    ),
-                    task_completed_date=COALESCE(
-                        pending_tasks.task_completed_date,
-                        excluded.task_completed_date
-                    ),
+                        THEN excluded.task_status ELSE pending_tasks.task_status END,
+                    working_date=COALESCE(pending_tasks.working_date,excluded.working_date),
+                    task_completed_date=COALESCE(pending_tasks.task_completed_date,excluded.task_completed_date),
                     team_remarks=CASE
                         WHEN COALESCE(TRIM(pending_tasks.team_remarks),'')=''
-                        THEN excluded.team_remarks
-                        ELSE pending_tasks.team_remarks
-                    END,
+                        THEN excluded.team_remarks ELSE pending_tasks.team_remarks END,
                     ticket_raised=CASE
                         WHEN COALESCE(TRIM(pending_tasks.ticket_raised),'')=''
-                        THEN excluded.ticket_raised
-                        ELSE pending_tasks.ticket_raised
-                    END,
-                    raised_date=COALESCE(
-                        pending_tasks.raised_date,
-                        excluded.raised_date
-                    ),
-                    last_update=CASE
-                        WHEN pending_tasks.last_update IS NULL
-                        THEN excluded.last_update
-                        ELSE pending_tasks.last_update
-                    END
-            """,(
-                r.get("portal",""),
-                r.get("order_no",""),
-                r.get("task_type",""),
-                r.get("branch_code",""),
-                r.get("task_created_date"),
-                r.get("task_status",""),
-                r.get("working_date"),
-                r.get("task_completed_date"),
-                r.get("team_remarks",""),
-                r.get("ticket_raised",""),
-                r.get("raised_date"),
-                r.get("last_update") or now,
-            ))
+                        THEN excluded.ticket_raised ELSE pending_tasks.ticket_raised END,
+                    raised_date=COALESCE(pending_tasks.raised_date,excluded.raised_date),
+                    last_update=COALESCE(pending_tasks.last_update,excluded.last_update)
+            """, task_rows)
 
         # MIR rows are already persistent and source refresh does not delete them.
-        # No destructive action is performed here intentionally.
-
         c.commit()
 
 
@@ -4828,7 +4805,13 @@ if workspace == "E-Com Reconciliation Dashboard":
                                 "The workbook was NOT saved. Please verify the source payment sheet."
                             )
 
-                        n = upsert_reconciliation(normalized,uploaded.name)
+                        cloud_save_started = perf_counter()
+                        n = upsert_reconciliation(normalized, uploaded.name)
+                        cloud_save_seconds = perf_counter() - cloud_save_started
+                        process_status.write(
+                            f"Database save completed: {n:,} {portal} orders in "
+                            f"{cloud_save_seconds:,.1f}s."
+                        )
 
                         adjustment_sync = None
                         return_type_sync = None
