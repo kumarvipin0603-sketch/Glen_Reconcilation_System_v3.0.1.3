@@ -882,110 +882,173 @@ def amazon_related_order_map(path):
         pass
     return mapping
 
+
+def _uniq_join_series(s):
+    """Ordered unique nonblank text join, matching the old group-loop behavior."""
+    vals = []
+    seen = set()
+    for v in s:
+        t = txt(v)
+        if t and t not in seen:
+            seen.add(t)
+            vals.append(t)
+    return " | ".join(vals)
+
+def _iso_min_series(s):
+    d = pd.to_datetime(s, errors="coerce").dropna()
+    return None if d.empty else d.min().date().isoformat()
+
+def _iso_max_series(s):
+    d = pd.to_datetime(s, errors="coerce").dropna()
+    return None if d.empty else d.max().date().isoformat()
+
+def _merge_group_records(result, frame, key="__id__"):
+    """Merge a pre-aggregated DataFrame into the enrichment result dictionary."""
+    if frame is None or frame.empty:
+        return
+    for rec in frame.to_dict("records"):
+        oid = clean_id(rec.pop(key, ""))
+        if not oid:
+            continue
+        dest = result.setdefault(oid, {})
+        for k, v in rec.items():
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            if isinstance(v, str) and not v:
+                continue
+            dest[k] = v
+
+
 @st.cache_data(show_spinner=False)
 def amazon_enrichment(path):
-    """Order/Sales/Reverse enrichment using the headers in Amazon FY 26-27."""
+    """
+    Vectorized Orders / Reverse / Sales enrichment.
+    Business rules are unchanged; expensive Python group loops are replaced
+    with pandas groupby aggregations.
+    """
     result = {}
 
-    # Orders: SKU, shipment date and branch.
+    # Orders
     try:
-        orders = read_sheet(path,["Orders"])
+        orders = read_sheet(path, ["Orders"])
         if not orders.empty:
-            oid = find_col(orders,["Amazon Order Id"])
-            sku = find_col(orders,["Merchant SKU","SKU"])
-            ship = find_col(orders,["Shipment Date"])
-            branch = find_col(orders,["Branch Code"])
+            oid = find_col(orders, ["Amazon Order Id"])
+            sku = find_col(orders, ["Merchant SKU", "SKU"])
+            ship = find_col(orders, ["Shipment Date"])
+            branch = find_col(orders, ["Branch Code"])
             if oid:
-                x=orders.copy(); x["__id__"]=x[oid].map(clean_id)
-                for order_id,g in x.groupby("__id__"):
-                    if not order_id: continue
-                    d=result.setdefault(order_id,{})
+                x = orders.copy()
+                x["__id__"] = x[oid].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                if not x.empty:
+                    parts = []
                     if sku:
-                        d["order_item"]=" | ".join(dict.fromkeys([txt(v) for v in g[sku] if txt(v)]))
+                        parts.append(x.groupby("__id__", sort=False)[sku].agg(_uniq_join_series).rename("order_item"))
                     if ship:
-                        ds=pd.to_datetime(g[ship],errors="coerce").dropna()
-                        if not ds.empty: d["shipment_date"]=ds.min().date().isoformat()
+                        sd = pd.to_datetime(x[ship], errors="coerce")
+                        parts.append(sd.groupby(x["__id__"], sort=False).min().dt.date.astype("string").rename("shipment_date"))
                     if branch:
-                        vals=[txt(v) for v in g[branch] if txt(v)]
-                        if vals: d["branch_code"]=vals[0]
+                        b = x[branch].map(txt)
+                        b = b.where(b.ne(""))
+                        parts.append(b.groupby(x["__id__"], sort=False).first().fillna("").rename("branch_code"))
+                    if parts:
+                        agg = pd.concat(parts, axis=1).reset_index()
+                        _merge_group_records(result, agg)
     except Exception:
         pass
 
-    # Reverse: operational return creation/delivery/status.
+    # Reverse
     try:
-        rev=read_sheet(path,["Reverse"])
+        rev = read_sheet(path, ["Reverse"])
         if not rev.empty:
-            oid=find_col(rev,["Order ID"])
-            created=find_col(rev,["Return Created Date"])
-            delivered=find_col(rev,[" Return Delivery Date","Return Delivery Date"])
-            status=find_col(rev,["Return status","Return Status"])
-            rtype=find_col(rev,["Return Type"])
+            oid = find_col(rev, ["Order ID"])
+            created = find_col(rev, ["Return Created Date"])
+            delivered = find_col(rev, [" Return Delivery Date", "Return Delivery Date"])
+            status = find_col(rev, ["Return status", "Return Status"])
+            rtype = find_col(rev, ["Return Type"])
             if oid:
-                x=rev.copy(); x["__id__"]=x[oid].map(clean_id)
-                for order_id,g in x.groupby("__id__"):
-                    if not order_id: continue
-                    d=result.setdefault(order_id,{})
+                x = rev.copy()
+                x["__id__"] = x[oid].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                if not x.empty:
+                    parts = []
                     if created:
-                        ds=pd.to_datetime(g[created],errors="coerce").dropna()
-                        if not ds.empty: d["return_created_date"]=ds.max().date().isoformat()
+                        d = pd.to_datetime(x[created], errors="coerce")
+                        parts.append(d.groupby(x["__id__"], sort=False).max().dt.date.astype("string").rename("return_created_date"))
                     if delivered:
-                        ds=pd.to_datetime(g[delivered],errors="coerce").dropna()
-                        if not ds.empty: d["return_delivery_date"]=ds.max().date().isoformat()
+                        d = pd.to_datetime(x[delivered], errors="coerce")
+                        parts.append(d.groupby(x["__id__"], sort=False).max().dt.date.astype("string").rename("return_delivery_date"))
                     if status:
-                        d["return_status"]=" | ".join(dict.fromkeys([txt(v) for v in g[status] if txt(v)]))
+                        parts.append(x.groupby("__id__", sort=False)[status].agg(_uniq_join_series).rename("return_status"))
                     if rtype:
-                        d["return_type"]=" | ".join(dict.fromkeys([txt(v) for v in g[rtype] if txt(v)]))
+                        parts.append(x.groupby("__id__", sort=False)[rtype].agg(_uniq_join_series).rename("return_type"))
+                    if parts:
+                        agg = pd.concat(parts, axis=1).reset_index()
+                        _merge_group_records(result, agg)
     except Exception:
         pass
 
-    # Sales: exact Invoice/CN numbers, dates, quantities and values.
+    # Sales / CN
     try:
-        sales=read_sheet(path,["Sales"])
+        sales = read_sheet(path, ["Sales"])
         if not sales.empty:
-            oid=find_col(sales,["Po Number","PO Number"])
-            inv=find_col(sales,["Invoice No"])
-            invd=find_col(sales,["Invoice Date"])
-            qty=find_col(sales,["Quantity"])
-            price=find_col(sales,["Item Price","Line Amount","Gross Amount"])
-            event=find_col(sales,["Sale/Return","Document Type"])
-            item=find_col(sales,["Product/Item No","Item Description"])
+            oid = find_col(sales, ["Po Number", "PO Number"])
+            inv = find_col(sales, ["Invoice No"])
+            invd = find_col(sales, ["Invoice Date"])
+            qty = find_col(sales, ["Quantity"])
+            price = find_col(sales, ["Item Price", "Line Amount", "Gross Amount"])
+            event = find_col(sales, ["Sale/Return", "Document Type"])
+            item = find_col(sales, ["Product/Item No", "Item Description"])
             if oid:
-                x=sales.copy(); x["__id__"]=x[oid].map(clean_id)
-                for order_id,g in x.groupby("__id__"):
-                    if not order_id: continue
-                    d=result.setdefault(order_id,{})
-                    is_return=pd.Series(False,index=g.index)
+                x = sales.copy()
+                x["__id__"] = x[oid].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                if not x.empty:
                     if event:
-                        is_return=g[event].astype(str).str.contains("RETURN|CREDIT|CN",case=False,na=False)
+                        is_return = x[event].astype(str).str.contains("RETURN|CREDIT|CN", case=False, na=False)
                     elif qty:
-                        is_return=pd.to_numeric(g[qty],errors="coerce").fillna(0)<0
-                    sale_g=g[~is_return]; ret_g=g[is_return]
-                    if item and not d.get("order_item"):
-                        vals=[txt(v) for v in sale_g[item] if txt(v)]
-                        if vals: d["order_item"]=" | ".join(dict.fromkeys(vals))
-                    if inv and not sale_g.empty:
-                        d["invoice_no"]=" | ".join(dict.fromkeys([txt(v) for v in sale_g[inv] if txt(v)]))
-                    if invd and not sale_g.empty:
-                        ds=pd.to_datetime(sale_g[invd],errors="coerce").dropna()
-                        if not ds.empty: d["invoice_date"]=ds.max().date().isoformat()
-                    if qty and not sale_g.empty:
-                        d["invoice_qty"]=abs(float(pd.to_numeric(sale_g[qty],errors="coerce").fillna(0).sum()))
-                    if price and not sale_g.empty:
-                        d["invoice_price"]=abs(float(pd.to_numeric(sale_g[price],errors="coerce").fillna(0).sum()))
-                    if inv and not ret_g.empty:
-                        d["cn_no"]=" | ".join(dict.fromkeys([txt(v) for v in ret_g[inv] if txt(v)]))
-                    if invd and not ret_g.empty:
-                        ds=pd.to_datetime(ret_g[invd],errors="coerce").dropna()
-                        if not ds.empty: d["cn_date"]=ds.max().date().isoformat()
-                    if qty and not ret_g.empty:
-                        d["cn_qty"]=abs(float(pd.to_numeric(ret_g[qty],errors="coerce").fillna(0).sum()))
-                    if price and not ret_g.empty:
-                        d["cn_price"]=abs(float(pd.to_numeric(ret_g[price],errors="coerce").fillna(0).sum()))
+                        is_return = pd.to_numeric(x[qty], errors="coerce").fillna(0) < 0
+                    else:
+                        is_return = pd.Series(False, index=x.index)
+
+                    for subset, is_cn in ((x.loc[~is_return].copy(), False), (x.loc[is_return].copy(), True)):
+                        if subset.empty:
+                            continue
+                        parts = []
+                        if item and not is_cn:
+                            parts.append(subset.groupby("__id__", sort=False)[item].agg(_uniq_join_series).rename("order_item"))
+                        if inv:
+                            parts.append(subset.groupby("__id__", sort=False)[inv].agg(_uniq_join_series).rename("cn_no" if is_cn else "invoice_no"))
+                        if invd:
+                            d = pd.to_datetime(subset[invd], errors="coerce")
+                            parts.append(d.groupby(subset["__id__"], sort=False).max().dt.date.astype("string").rename("cn_date" if is_cn else "invoice_date"))
+                        if qty:
+                            q = pd.to_numeric(subset[qty], errors="coerce").fillna(0)
+                            parts.append(q.groupby(subset["__id__"], sort=False).sum().abs().rename("cn_qty" if is_cn else "invoice_qty"))
+                        if price:
+                            p = pd.to_numeric(subset[price], errors="coerce").fillna(0)
+                            parts.append(p.groupby(subset["__id__"], sort=False).sum().abs().rename("cn_price" if is_cn else "invoice_price"))
+                        if parts:
+                            agg = pd.concat(parts, axis=1).reset_index()
+                            # Preserve Orders-derived SKU: Sales only fills SKU if missing.
+                            if not is_cn and "order_item" in agg.columns:
+                                for rec in agg.to_dict("records"):
+                                    oid2 = clean_id(rec.pop("__id__", ""))
+                                    if not oid2:
+                                        continue
+                                    dest = result.setdefault(oid2, {})
+                                    sale_item = rec.pop("order_item", "")
+                                    if sale_item and not dest.get("order_item"):
+                                        dest["order_item"] = sale_item
+                                    for k, v in rec.items():
+                                        if pd.notna(v) and not (isinstance(v, str) and not v):
+                                            dest[k] = v
+                            else:
+                                _merge_group_records(result, agg)
     except Exception:
         pass
 
-    # Replacement IDs are not primary reconciliation rows.
-    # Roll every applicable source detail back to the original order.
+    # Replacement roll-up: preserve existing business behavior.
     related_map = amazon_related_order_map(path)
 
     def combine_text(values):
@@ -1000,59 +1063,31 @@ def amazon_enrichment(path):
         return " | ".join(out)
 
     def latest_date(values):
-        parsed = pd.to_datetime(
-            [v for v in values if v],
-            errors="coerce"
-        )
+        parsed = pd.to_datetime([v for v in values if v], errors="coerce")
         parsed = pd.Series(parsed).dropna()
-        if parsed.empty:
-            return None
-        return parsed.max().date().isoformat()
+        return None if parsed.empty else parsed.max().date().isoformat()
 
     for original, related_ids in related_map.items():
-        dest = result.setdefault(original,{})
+        dest = result.setdefault(original, {})
         dest["replacement_order_id"] = " | ".join(related_ids[1:])
+        related_details = [result.get(rid, {}) for rid in related_ids]
 
-        related_details = [
-            result.get(rid,{})
-            for rid in related_ids
-        ]
-
-        # Text fields can legitimately exist on original and replacement IDs.
-        for key in [
-            "order_item","return_status","return_type",
-            "invoice_no","cn_no"
-        ]:
-            combined = combine_text(
-                [d.get(key) for d in related_details]
-            )
+        for key in ["order_item", "return_status", "return_type", "invoice_no", "cn_no"]:
+            combined = combine_text([d.get(key) for d in related_details])
             if combined:
                 dest[key] = combined
 
-        # Use latest operational/accounting date across related IDs.
-        for key in [
-            "return_created_date","return_delivery_date",
-            "invoice_date","cn_date"
-        ]:
-            latest = latest_date(
-                [d.get(key) for d in related_details]
-            )
+        for key in ["return_created_date", "return_delivery_date", "invoice_date", "cn_date"]:
+            latest = latest_date([d.get(key) for d in related_details])
             if latest:
                 dest[key] = latest
 
-        # Sum invoice/CN quantities and values across original + replacements.
-        for key in [
-            "invoice_qty","invoice_price","cn_qty","cn_price"
-        ]:
-            values = [
-                float(d.get(key,0) or 0)
-                for d in related_details
-            ]
+        for key in ["invoice_qty", "invoice_price", "cn_qty", "cn_price"]:
+            values = [float(d.get(key, 0) or 0) for d in related_details]
             if any(values):
                 dest[key] = sum(values)
 
     return result
-
 
 
 def amazon_adjustment_source_total(path):
@@ -1458,81 +1493,130 @@ def amazon_reimbursement_enrichment(path):
 
 @st.cache_data(show_spinner=False)
 def flipkart_enrichment(path):
-    """ERP invoice/CN plus order/return details from Flipkart FY 26-27."""
-    result={}
+    """
+    Vectorized Flipkart ERP / All Orders / Returns enrichment.
+    Replaces per-PO Python group loops with pandas aggregations.
+    """
+    result = {}
+
     # ERP Sales Register
     try:
-        erp = source_sheet(path, ("ERP Sales Register","ERP"), fuzzy=True)
+        erp = source_sheet(path, ("ERP Sales Register", "ERP"), fuzzy=True)
         if not erp.empty:
-            po=find_col(erp,["Po Number"]); inv=find_col(erp,["Invoice No"]); invd=find_col(erp,["Invoice Date"])
-            qty=find_col(erp,["Quantity"]); price=find_col(erp,["Line Amount","Gross Amount"])
-            branch=find_col(erp,["Branch Code"]); tx=find_col(erp,["Sale/Return","Document Type"]); item=find_col(erp,["Product/Item No","Item Description"])
+            po = find_col(erp, ["Po Number"])
+            inv = find_col(erp, ["Invoice No"])
+            invd = find_col(erp, ["Invoice Date"])
+            qty = find_col(erp, ["Quantity"])
+            price = find_col(erp, ["Line Amount", "Gross Amount"])
+            branch = find_col(erp, ["Branch Code"])
+            tx = find_col(erp, ["Sale/Return", "Document Type"])
+            item = find_col(erp, ["Product/Item No", "Item Description"])
             if po:
-                x=erp.copy(); x["__id__"]=x[po].map(clean_id)
-                for order_id,g in x.groupby("__id__"):
-                    if not order_id: continue
-                    d=result.setdefault(order_id,{})
+                x = erp.copy()
+                x["__id__"] = x[po].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                if not x.empty:
+                    # Branch first nonblank
                     if branch:
-                        vals=[txt(v) for v in g[branch] if txt(v)]
-                        if vals: d["branch_code"]=vals[0]
-                    is_cn=pd.Series(False,index=g.index)
-                    if tx: is_cn=g[tx].astype(str).str.contains("RETURN|CREDIT|CN",case=False,na=False)
-                    elif qty: is_cn=pd.to_numeric(g[qty],errors="coerce").fillna(0)<0
-                    sale_g=g[~is_cn]; cn_g=g[is_cn]
-                    if item:
-                        vals=[txt(v) for v in sale_g[item] if txt(v)]
-                        if vals: d["order_item"]=" | ".join(dict.fromkeys(vals))
-                    if inv and not sale_g.empty: d["invoice_no"]=" | ".join(dict.fromkeys([txt(v) for v in sale_g[inv] if txt(v)]))
-                    if invd and not sale_g.empty:
-                        ds=pd.to_datetime(sale_g[invd],errors="coerce").dropna()
-                        if not ds.empty: d["invoice_date"]=ds.max().date().isoformat()
-                    if qty and not sale_g.empty: d["invoice_qty"]=abs(float(pd.to_numeric(sale_g[qty],errors="coerce").fillna(0).sum()))
-                    if price and not sale_g.empty: d["invoice_price"]=abs(float(pd.to_numeric(sale_g[price],errors="coerce").fillna(0).sum()))
-                    if inv and not cn_g.empty: d["cn_no"]=" | ".join(dict.fromkeys([txt(v) for v in cn_g[inv] if txt(v)]))
-                    if invd and not cn_g.empty:
-                        ds=pd.to_datetime(cn_g[invd],errors="coerce").dropna()
-                        if not ds.empty: d["cn_date"]=ds.max().date().isoformat()
-                    if qty and not cn_g.empty: d["cn_qty"]=abs(float(pd.to_numeric(cn_g[qty],errors="coerce").fillna(0).sum()))
-                    if price and not cn_g.empty: d["cn_price"]=abs(float(pd.to_numeric(cn_g[price],errors="coerce").fillna(0).sum()))
-    except Exception: pass
+                        b = x[branch].map(txt).where(lambda s: s.ne(""))
+                        agg = b.groupby(x["__id__"], sort=False).first().fillna("").rename("branch_code").reset_index()
+                        _merge_group_records(result, agg)
 
-    # All Orders: product item + delivery date/status.
+                    if tx:
+                        is_cn = x[tx].astype(str).str.contains("RETURN|CREDIT|CN", case=False, na=False)
+                    elif qty:
+                        is_cn = pd.to_numeric(x[qty], errors="coerce").fillna(0) < 0
+                    else:
+                        is_cn = pd.Series(False, index=x.index)
+
+                    for subset, cnflag in ((x.loc[~is_cn].copy(), False), (x.loc[is_cn].copy(), True)):
+                        if subset.empty:
+                            continue
+                        parts = []
+                        if item and not cnflag:
+                            parts.append(subset.groupby("__id__", sort=False)[item].agg(_uniq_join_series).rename("order_item"))
+                        if inv:
+                            parts.append(subset.groupby("__id__", sort=False)[inv].agg(_uniq_join_series).rename("cn_no" if cnflag else "invoice_no"))
+                        if invd:
+                            d = pd.to_datetime(subset[invd], errors="coerce")
+                            parts.append(d.groupby(subset["__id__"], sort=False).max().dt.date.astype("string").rename("cn_date" if cnflag else "invoice_date"))
+                        if qty:
+                            q = pd.to_numeric(subset[qty], errors="coerce").fillna(0)
+                            parts.append(q.groupby(subset["__id__"], sort=False).sum().abs().rename("cn_qty" if cnflag else "invoice_qty"))
+                        if price:
+                            p = pd.to_numeric(subset[price], errors="coerce").fillna(0)
+                            parts.append(p.groupby(subset["__id__"], sort=False).sum().abs().rename("cn_price" if cnflag else "invoice_price"))
+                        if parts:
+                            _merge_group_records(result, pd.concat(parts, axis=1).reset_index())
+    except Exception:
+        pass
+
+    # All Orders
     try:
-        orders = source_sheet(path, ("Flipkart All Orders","All Orders"), fuzzy=True)
-        po=find_col(orders,["Po Number"]); item=find_col(orders,["sku","product_title"]); status=find_col(orders,["Order Item Status"]); delivery=find_col(orders,["order_delivery_date"])
-        if po:
-            x=orders.copy(); x["__id__"]=x[po].map(clean_id)
-            for order_id,g in x.groupby("__id__"):
-                if not order_id: continue
-                d=result.setdefault(order_id,{})
-                if item and not d.get("order_item"):
-                    d["order_item"]=" | ".join(dict.fromkeys([txt(v) for v in g[item] if txt(v)]))
-                if status: d["order_status"]=" | ".join(dict.fromkeys([txt(v) for v in g[status] if txt(v)]))
+        orders = source_sheet(path, ("Flipkart All Orders", "All Orders"), fuzzy=True)
+        if not orders.empty:
+            po = find_col(orders, ["Po Number"])
+            item = find_col(orders, ["sku", "product_title"])
+            status = find_col(orders, ["Order Item Status"])
+            delivery = find_col(orders, ["order_delivery_date"])
+            if po:
+                x = orders.copy()
+                x["__id__"] = x[po].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                parts = []
+                if item:
+                    parts.append(x.groupby("__id__", sort=False)[item].agg(_uniq_join_series).rename("_all_order_item"))
+                if status:
+                    parts.append(x.groupby("__id__", sort=False)[status].agg(_uniq_join_series).rename("order_status"))
                 if delivery:
-                    ds=pd.to_datetime(g[delivery],errors="coerce").dropna()
-                    if not ds.empty: d["delivery_date"]=ds.max().date().isoformat()
-    except Exception: pass
+                    d = pd.to_datetime(x[delivery], errors="coerce")
+                    parts.append(d.groupby(x["__id__"], sort=False).max().dt.date.astype("string").rename("delivery_date"))
+                if parts:
+                    agg = pd.concat(parts, axis=1).reset_index()
+                    for rec in agg.to_dict("records"):
+                        oid2 = clean_id(rec.pop("__id__", ""))
+                        if not oid2:
+                            continue
+                        dest = result.setdefault(oid2, {})
+                        alt_item = rec.pop("_all_order_item", "")
+                        if alt_item and not dest.get("order_item"):
+                            dest["order_item"] = alt_item
+                        for k, v in rec.items():
+                            if pd.notna(v) and not (isinstance(v, str) and not v):
+                                dest[k] = v
+    except Exception:
+        pass
 
-    # Returns: approval and completion dates/status.
+    # Returns
     try:
-        ret = source_sheet(path, ("Flipkart Returns","Returns"), fuzzy=True)
-        po=find_col(ret,["Po Number"]); approval=find_col(ret,["Return Approval Date"]); complete=find_col(ret,["return_completion_date"]); status=find_col(ret,["return_status"]); rtype=find_col(ret,["Return Type"])
-        if po:
-            x=ret.copy(); x["__id__"]=x[po].map(clean_id)
-            for order_id,g in x.groupby("__id__"):
-                if not order_id: continue
-                d=result.setdefault(order_id,{})
+        ret = source_sheet(path, ("Flipkart Returns", "Returns"), fuzzy=True)
+        if not ret.empty:
+            po = find_col(ret, ["Po Number"])
+            approval = find_col(ret, ["Return Approval Date"])
+            complete = find_col(ret, ["return_completion_date"])
+            status = find_col(ret, ["return_status"])
+            rtype = find_col(ret, ["Return Type"])
+            if po:
+                x = ret.copy()
+                x["__id__"] = x[po].map(clean_id)
+                x = x[x["__id__"].ne("")]
+                parts = []
                 if approval:
-                    ds=pd.to_datetime(g[approval],errors="coerce").dropna()
-                    if not ds.empty: d["return_approval_date"]=ds.max().date().isoformat()
+                    d = pd.to_datetime(x[approval], errors="coerce")
+                    parts.append(d.groupby(x["__id__"], sort=False).max().dt.date.astype("string").rename("return_approval_date"))
                 if complete:
-                    ds=pd.to_datetime(g[complete],errors="coerce").dropna()
-                    if not ds.empty: d["return_completion_date"]=ds.max().date().isoformat()
-                if status: d["return_status"]=" | ".join(dict.fromkeys([txt(v) for v in g[status] if txt(v)]))
-                if rtype: d["return_type"]=" | ".join(dict.fromkeys([txt(v) for v in g[rtype] if txt(v)]))
-    except Exception: pass
-    return result
+                    d = pd.to_datetime(x[complete], errors="coerce")
+                    parts.append(d.groupby(x["__id__"], sort=False).max().dt.date.astype("string").rename("return_completion_date"))
+                if status:
+                    parts.append(x.groupby("__id__", sort=False)[status].agg(_uniq_join_series).rename("return_status"))
+                if rtype:
+                    parts.append(x.groupby("__id__", sort=False)[rtype].agg(_uniq_join_series).rename("return_type"))
+                if parts:
+                    _merge_group_records(result, pd.concat(parts, axis=1).reset_index())
+    except Exception:
+        pass
 
+    return result
 
 
 def flipkart_return_approval_enrichment(path):
@@ -4677,7 +4761,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.4 — Workbook Enrichment Cache Optimization")
+st.caption("Build: v15.5 — Vectorized Marketplace Enrichment")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
