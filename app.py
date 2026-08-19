@@ -4668,7 +4668,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.2 — Supabase Post-Save Performance & Stage Diagnostics")
+st.caption("Build: v15.3 — Clean UI & Dashboard Performance Diagnostics")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
@@ -4991,87 +4991,21 @@ if workspace == "E-Com Reconciliation Dashboard":
             if errors:
                 st.error("\n".join(errors))
 
-        st.markdown("#### Manual Repair — Amazon Return Type (only if required)")
-        if st.button(
-            "Sync Return Type from Reverse Column A",
-            use_container_width=True,
-            disabled=not has_saved_source("Amazon")
-        ):
-            try:
-                vals = backfill_amazon_return_type_from_source(
-                    saved_source_path("Amazon")
-                )
-                st.success(
-                    f"Return Type synced — Updated Orders {vals['updated_orders']:,} | "
-                    f"Customer Return {vals['customer_return_orders']:,} | "
-                    f"Courier Return {vals['courier_return_orders']:,}"
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-
-        st.markdown("#### Manual Repair — Amazon Adjustment (only if required)")
-        if st.button(
-            "Sync Adjustment from Amazon Payments",
-            use_container_width=True,
-            disabled=not has_saved_source("Amazon")
-        ):
-            try:
-                vals = backfill_amazon_adjustment_from_source(
-                    saved_source_path("Amazon")
-                )
-                st.success(
-                    f"Adjustment Source Total ₹{vals['source_total']:,.2f} | "
-                    f"Matched Orders {vals['matched_orders']:,} | "
-                    f"Order-wise ₹{vals['matched_total']:,.2f} | "
-                    f"Unallocated/Unmatched ₹{vals['unmatched_total']:,.2f}"
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-
-        st.markdown("#### Manual Rebuild From Last Verified Source (only if required)")
-        rc1, rc2 = st.columns(2)
-
-        if rc1.button(
-            "Rebuild Amazon Dashboard",
-            use_container_width=True,
-            disabled=not has_saved_source("Amazon")
-        ):
-            try:
-                values = rebuild_portal_from_saved_source("Amazon")
-                st.success(
-                    "Amazon rebuilt successfully — "
-                    f"Replacement Orders {values['replacement_orders']:,} | "
-                    f"Repl Qty {values['repl_quantity']:,.0f} | "
-                    f"Courier Returns {values['courier_returns']:,.0f} | "
-                    f"Rece ₹{values['rece_amount']:,.2f} | "
-                    f"Deferred ₹{values['deferred_amount']:,.2f}"
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-
-        if rc2.button(
-            "Rebuild Flipkart Dashboard",
-            use_container_width=True,
-            disabled=not has_saved_source("Flipkart")
-        ):
-            try:
-                values = rebuild_portal_from_saved_source("Flipkart")
-                st.success(
-                    "Flipkart rebuilt successfully — "
-                    f"Rece ₹{values['rece_amount']:,.2f}"
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+        # Manual repair/rebuild controls intentionally hidden from the normal UI.
+        # Underlying recovery functions remain available in code for maintenance,
+        # but source uploads already auto-sync the required derived fields.
 
     else:
         st.info("Dashboard is read-only for team users. Admin PIN is required only for Amazon/Flipkart source uploads.")
 
+    _render_started = perf_counter()
+    _stage = perf_counter()
     master = load_master()
+    st.caption(f"Dashboard data load: {perf_counter()-_stage:,.1f}s")
+
+    _stage = perf_counter()
     display = ecom_process_display(master)
+    st.caption(f"Dashboard preparation: {perf_counter()-_stage:,.1f}s")
 
     if display.empty:
         st.info(
@@ -5100,7 +5034,10 @@ if workspace == "E-Com Reconciliation Dashboard":
         "Summary values recalculate from the current filters."
     )
 
+    _stage = perf_counter()
     filtered = apply_global_filters(display,"ecom")
+    st.caption(f"Filter processing: {perf_counter()-_stage:,.1f}s")
+    st.caption(f"Dashboard ready in {perf_counter()-_render_started:,.1f}s")
 
     st.markdown("### Reconciliation Summary")
 
