@@ -3392,11 +3392,36 @@ def _master_with_operational_overlay(master):
     current = master["pending_remarks"].fillna("").astype(str)
     new_remarks = current.copy()
 
-    return_date = pd.to_datetime(master.get("return_delivery_date"), errors="coerce")
-    tei_no = master.get("tei_no", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
-    tei_date = pd.to_datetime(master.get("tei_date"), errors="coerce")
-    cn_no = master.get("cn_no", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
-    cn_date = pd.to_datetime(master.get("cn_date"), errors="coerce")
+    # Always keep date inputs as Series. If a column is absent, pd.to_datetime(None)
+    # returns a scalar NaT/None-like value and `.dt` will fail.
+    return_date = pd.to_datetime(
+        master["return_delivery_date"]
+        if "return_delivery_date" in master.columns
+        else pd.Series(pd.NaT, index=master.index),
+        errors="coerce"
+    )
+    tei_no = (
+        master["tei_no"]
+        if "tei_no" in master.columns
+        else pd.Series("", index=master.index)
+    ).fillna("").astype(str).str.strip()
+    tei_date = pd.to_datetime(
+        master["tei_date"]
+        if "tei_date" in master.columns
+        else pd.Series(pd.NaT, index=master.index),
+        errors="coerce"
+    )
+    cn_no = (
+        master["cn_no"]
+        if "cn_no" in master.columns
+        else pd.Series("", index=master.index)
+    ).fillna("").astype(str).str.strip()
+    cn_date = pd.to_datetime(
+        master["cn_date"]
+        if "cn_date" in master.columns
+        else pd.Series(pd.NaT, index=master.index),
+        errors="coerce"
+    )
     today_ts = pd.Timestamp(date.today())
 
     # Priority 1: return received >=2 days and TEI still absent.
@@ -4833,7 +4858,7 @@ backfill_missing_tasks_from_master()
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.6 — Fast Dashboard Operational Overlay")
+st.caption("Build: v15.6.1 — Fast Dashboard Overlay Hotfix")
 st.caption(
     "Persistent multi-portal reconciliation. Amazon and Flipkart can be uploaded together "
     "or one by one. The latest source workbook, reconciliation, task and MIR updates are stored in the persistent cloud database and remain "
